@@ -20,6 +20,7 @@ from queue import Queue
 from typing import List, Tuple, Optional, Dict, Callable
 from dataclasses import dataclass, field
 
+import os
 import numpy as np
 import nvtx
 import torch
@@ -30,7 +31,6 @@ from flexkv.cache.radixtree import RadixTreeIndex, RadixNode, MatchResult
 from flexkv.cache.transfer_pattern import add_virtal_op_for_mutiple_finished_ops
 from flexkv.common.block import SequenceMeta
 from flexkv.common.config import CacheConfig, ModelConfig, GLOBAL_CONFIG_FROM_ENV
-from flexkv.common.exceptions import InvalidConfigError, NotEnoughSpaceError
 from flexkv.common.transfer import (
     DeviceType, TransferOpGraph, TransferOp, TransferType
 )
@@ -55,11 +55,11 @@ class CacheEngineAccel:
                  evict_ratio: float,
                  hit_reward_seconds: int = 0):
         if not isinstance(device_type, DeviceType):
-            raise InvalidConfigError(f"Unknown device type: {device_type}")
+            raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
-            raise InvalidConfigError(f"Invalid num_total_blocks: {num_total_blocks}")
+            raise ValueError(f"Invalid num_total_blocks: {num_total_blocks}")
         if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
-            raise InvalidConfigError(f"Invalid tokens_per_block: {tokens_per_block}, "
+            raise ValueError(f"Invalid tokens_per_block: {tokens_per_block}, "
                               f"tokens_per_block must be a power of 2")
 
         self.device_type = device_type
@@ -137,9 +137,9 @@ class CacheEngineAccel:
             if protected_node is not None:
                 self.index.unlock(protected_node)
         if strict and num_required_blocks > self.mempool.num_free_blocks:
-            raise NotEnoughSpaceError("Not enough free blocks to take, ",
-                                      required=num_required_blocks,
-                                      available=self.mempool.num_free_blocks)
+            raise RuntimeError(f"Not enough free blocks to take, "
+                               f"required: {num_required_blocks}, "
+                               f"available: {self.mempool.num_free_blocks}")
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
         return self.mempool.allocate_blocks(num_allocated_blocks)
 
@@ -154,11 +154,11 @@ class CacheEngine:
                  evict_ratio: float,
                  hit_reward_seconds: int = 0):
         if not isinstance(device_type, DeviceType):
-            raise InvalidConfigError(f"Unknown device type: {device_type}")
+            raise ValueError(f"Unknown device type: {device_type}")
         if num_total_blocks <= 0:
-            raise InvalidConfigError(f"Invalid num_total_blocks: {num_total_blocks}")
+            raise ValueError(f"Invalid num_total_blocks: {num_total_blocks}")
         if tokens_per_block <= 0 or (tokens_per_block & (tokens_per_block - 1)) != 0:
-            raise InvalidConfigError(f"Invalid tokens_per_block: {tokens_per_block}, "
+            raise ValueError(f"Invalid tokens_per_block: {tokens_per_block}, "
                               f"tokens_per_block must be a power of 2")
 
         self.device_type = device_type
@@ -218,9 +218,9 @@ class CacheEngine:
             if protected_node is not None:
                 self.index.unlock(protected_node)
         if strict and num_required_blocks > self.mempool.num_free_blocks:
-            raise NotEnoughSpaceError("Not enough free blocks to take, ",
-                                      required=num_required_blocks,
-                                      available=self.mempool.num_free_blocks)
+            raise RuntimeError("Not enough free blocks to take, ",
+                               f"required: {num_required_blocks}, "
+                               f"available: {self.mempool.num_free_blocks}")
         num_allocated_blocks = min(num_required_blocks, self.mempool.num_free_blocks)
         return self.mempool.allocate_blocks(num_allocated_blocks)
 
@@ -320,8 +320,13 @@ class GlobalCacheEngine:
             raise NotImplementedError(f"Layerwise transfer is not supported yet, "
                                       f"layer_num: {layer_num}, layer_granularity: {layer_granularity}")
 
-        # ignore the last incomplete block
-        aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
+        combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
+        if not combine_with_trtllm:
+            aligned_length = (token_ids.shape[0] // self.tokens_per_block) * self.tokens_per_block
+        else:
+            # When using FlexKV with TensorRT-LLM, we ignore the last incomplete block.
+            aligned_length = ((token_ids.shape[0] - 1) // self.tokens_per_block) * self.tokens_per_block
+
         aligned_token_ids = token_ids[:aligned_length]
         token_mask = token_mask[:aligned_length]
 
@@ -626,7 +631,9 @@ class GlobalCacheEngine:
                 )
                 transfer_graph.add_transfer_op(op_gds_transfer)
                 finished_ops_ids.append(op_gds_transfer.op_id)
-                op_node_to_ready[op_gds_transfer.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
+                op_node_to_ready[op_gds_transfer.op_id] = (DeviceType.SSD,
+                                                           ssd_node_to_unlock,
+                                                           ssd_node_to_unlock.size())
             else:
                 fragment2_cpu_blocks = self.cpu_cache_engine.take(
                     num_required_blocks=fragment2_num_blocks,
@@ -970,7 +977,7 @@ class GlobalCacheEngine:
             protected_node = cpu_matched_result.last_node,
             strict=False
         )
-        
+
         if self.cache_config.enable_ssd:
             fragment2_ssd_blocks = self.ssd_cache_engine.take(
                 num_required_blocks=fragment2_num_blocks,
@@ -1003,7 +1010,13 @@ class GlobalCacheEngine:
         finished_ops_ids.append(op_d2h.op_id)
 
         if fragment2_num_blocks > 0:
-            fragment2_cpu_blocks = fragment12_cpu_blocks[-fragment2_num_blocks:]
+            if len(fragment12_cpu_blocks) < fragment2_num_blocks:
+                flexkv_logger.warning(f"fragment12_cpu_blocks: {len(fragment12_cpu_blocks)}, fragment2_num_blocks: {fragment2_num_blocks}, \
+                    cpu match blocks is bigger than SSD match blocks number. This should not often happen if CPU cache size is smaller than SSD cache size.")
+                num_needed_from_cpu_matched = fragment2_num_blocks - len(fragment12_cpu_blocks)
+                fragment2_cpu_blocks = np.concatenate([cpu_matched_blocks[-num_needed_from_cpu_matched:], fragment12_cpu_blocks])
+            else:
+                fragment2_cpu_blocks = fragment12_cpu_blocks[-fragment2_num_blocks:]
             op_h2disk = TransferOp(
                 graph_id = transfer_graph.graph_id,
                 transfer_type = TransferType.H2DISK,

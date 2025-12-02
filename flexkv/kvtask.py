@@ -19,7 +19,10 @@ from flexkv.common.tracer import FlexKVTracer
 from flexkv.cache.cache_engine import GlobalCacheEngine
 from flexkv.transfer_manager import TransferManagerHandle, TransferManagerOnRemote
 from flexkv.common.request import KVResponseStatus, KVResponse
-from flexkv.transfer_manager import get_master_host_and_ports_from_env
+from flexkv.transfer_manager import (
+    get_master_host_and_ports_from_env,
+    get_trtllm_subprocess_host_and_ports_from_env
+)
 
 class TaskStatus(Enum):
     # slot mapping is not ready
@@ -92,28 +95,48 @@ class KVTaskManager:
         self._check_config(model_config, cache_config)
 
         self.is_multinode_tp = False
-        self.tp_size_per_node = model_config.tp_size
-
-        if self.model_config.tp_size > self.tp_size_per_node:
+        self.tp_node_count = 1
+        if self.model_config.tp_size > torch.cuda.device_count():
             if self.model_config.tp_size != torch.cuda.device_count() * 2:
-                raise ValueError("Only support 2 nodes TP")
-            if self.model_config.dp_size != 1:
-                raise ValueError("Only support dp_size=1 for multi-node TP")
+                raise ValueError("Only support 2 nodes TP for now")
+            assert self.model_config.dp_size == 1
+            self.tp_node_count = self.model_config.tp_size // torch.cuda.device_count()
             self.is_multinode_tp = True
-            self.tp_size_per_node = torch.cuda.device_count()
 
         self.cache_engine = GlobalCacheEngine(cache_config, model_config)
 
         model_config_for_transfer = copy.deepcopy(self.model_config)
-        if self.is_multinode_tp and not self.model_config.use_mla:
-            model_config_for_transfer.num_kv_heads = self.tp_size_per_node
+        if self.is_multinode_tp:
+            model_config_for_transfer.tp_size //= self.tp_node_count
+            if not self.model_config.use_mla:
+                model_config_for_transfer.num_kv_heads //= self.tp_node_count
 
-        self.transfer_handles = [TransferManagerHandle(
-            model_config_for_transfer,
-            self.cache_config,
-            mode="process",
-            gpu_register_port=gpu_register_port
-        )]
+        combine_with_trtllm = os.getenv("FLEXKV_WITH_TRTLLM", "0") == "1"
+        if not combine_with_trtllm:
+            self.transfer_handles = [TransferManagerHandle(
+                model_config_for_transfer,
+                self.cache_config,
+                mode="process",
+                gpu_register_port=gpu_register_port
+            )]
+        else:
+            # When using FlexKV with TensorRT-LLM, we use remote mode to transfer data
+            #  to avoid the way we launch subprocess in FlexKV
+            #  conflict with TensorRT-LLM's MPI initialization
+            master_host, master_ports = get_trtllm_subprocess_host_and_ports_from_env()
+            self.remote_process = TransferManagerOnRemote.create_process(mode="TrtllmSubprocess")
+            self.transfer_handles = [
+                TransferManagerHandle(
+                    model_config_for_transfer,
+                    self.cache_config,
+                    mode="remote",
+                    gpu_register_port=gpu_register_port,
+                    master_host=master_host,
+                    master_ports=master_ports
+                )
+            ]
+            self.transfer_handles[0]._handle.send_config_to_remotes()
+
         if self.is_multinode_tp:
             master_host, master_ports = get_master_host_and_ports_from_env()
             self.transfer_handles.append(TransferManagerHandle(
@@ -124,7 +147,7 @@ class KVTaskManager:
                 master_host=master_host,
                 master_ports=master_ports
             ))
-            self.transfer_handles[0]._handle.send_config_to_remotes()
+            self.transfer_handles[-1]._handle.send_config_to_remotes()
 
         self.tasks: ExpiringDict[int, KVTask] = ExpiringDict(max_age_seconds=1800, max_len=100000) # 30 minutes
         self.graph_to_task: Dict[int, int] = {}
@@ -152,6 +175,12 @@ class KVTaskManager:
         if hasattr(self, "transfer_handles") and self.transfer_handles is not None:
             for transfer_handle in self.transfer_handles:
                 transfer_handle.shutdown()
+        if hasattr(self, "remote_process") and self.remote_process is not None:
+            assert self.remote_process.is_alive()
+            self.remote_process.terminate()
+            self.remote_process.join()
+            self.remote_process.close()
+            self.remote_process = None
 
     def create_get_task(self,
                         task_id: int,

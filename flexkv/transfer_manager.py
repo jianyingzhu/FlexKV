@@ -11,6 +11,10 @@ import zmq
 import tempfile
 import threading
 import numpy as np
+import textwrap
+import subprocess
+import pickle
+import sys
 
 from flexkv.common.transfer import TransferOpGraph
 from flexkv.common.config import CacheConfig, ModelConfig
@@ -42,6 +46,7 @@ class TransferManager:
 
         self.transfer_engine: Optional[TransferEngine] = None
         self.storage_engine = StorageEngine(self.model_config, self.cache_config)
+        flexkv_logger.info(f"Initialized TransferManager with config successfully")
 
     def _handle_gpu_blocks_registration(self, req: RegisterTPClientRequest) -> None:
         device_id = req.device_id
@@ -55,7 +60,6 @@ class TransferManager:
             try:
                 self.all_gpu_blocks[device_id] = req.handles
                 self.all_gpu_layouts[device_id] = req.gpu_layout
-                flexkv_logger.info(f"GPU {device_id} registered successfully")
             except Exception as e:
                 flexkv_logger.error(f"Failed to register GPU {device_id}: {e}")
 
@@ -64,9 +68,10 @@ class TransferManager:
             flexkv_logger.info(f"GPU tensor registration server started on port {self.gpu_register_port}")
 
             expected_gpus = self.model_config.tp_size * self.model_config.dp_size
-
+            flexkv_logger.info(f"{self.model_config.tp_size=}, {self.model_config.dp_size=}, {expected_gpus=}")
             while len(self.all_gpu_blocks) < expected_gpus:
                 try:
+                    # Recv from: flexkv.server.client.KVTPClient.register_to_server
                     req = self.recv_from_client.recv_pyobj(zmq.NOBLOCK)
                 except zmq.Again:
                     time.sleep(0.001)
@@ -75,6 +80,8 @@ class TransferManager:
                 if isinstance(req, RegisterTPClientRequest):
                     flexkv_logger.info(f"Received GPU blocks registration request: {type(req)}")
                     self._handle_gpu_blocks_registration(req)
+                    flexkv_logger.info(f"GPU {req.device_id} registered successfully, \
+                        waiting for {expected_gpus - len(self.all_gpu_blocks)} GPUs to register")
                 else:
                     flexkv_logger.error(f"Unrecognized RequestType in SchedulerServer: {type(req)}")
 
@@ -90,6 +97,7 @@ class TransferManager:
             # self.context.term()
 
     def initialize_transfer_engine(self) -> None:
+        flexkv_logger.info(f"Initializing TransferEngine...")
         self._register_gpu_blocks_via_socket()
 
         assert len(self.all_gpu_layouts) == self.model_config.tp_size * self.model_config.dp_size
@@ -118,6 +126,7 @@ class TransferManager:
                                               cpu_handle=cpu_handle,
                                               ssd_handle=ssd_handle,
                                               remote_handle=remote_handle)
+        flexkv_logger.info(f"Initialized TransferEngine successfully")
 
     def submit(self, transfer_graph: TransferOpGraph) -> None:
         self.transfer_engine.submit_transfer_graph(transfer_graph)
@@ -129,20 +138,32 @@ class TransferManager:
         self.transfer_engine.start()
 
     def shutdown(self) -> None:
-        self.transfer_engine.shutdown()
+        if hasattr(self, 'transfer_engine'):
+            self.transfer_engine.shutdown()
 
 def get_master_host_and_ports_from_env() -> Tuple[str, Tuple[str, str, str]]:
-    master_host = os.getenv("MASTER_HOST", "localhost")
-    master_ports = os.getenv("MASTER_PORTS", "5556,5557,5558")
+    master_host = os.getenv("FLEXKV_MASTER_HOST", "localhost")
+    master_ports = os.getenv("FLEXKV_MASTER_PORTS", "5556,5557,5558")
     master_ports = tuple(master_ports.split(","))
     return "tcp://" + master_host, master_ports
+
+def get_trtllm_subprocess_host_and_ports_from_env() -> Tuple[str, Tuple[str, str, str]]:
+    flexkv_trt_subprocess_host = os.getenv("FLEXKV_TRT_SUBPROCESS_HOST", "localhost")
+    flexkv_trt_subprocess_ports = os.getenv("FLEXKV_TRT_SUBPROCESS_PORTS", "6667,6668,6669")
+    flexkv_trt_subprocess_ports = tuple(flexkv_trt_subprocess_ports.split(","))
+    return "tcp://" + flexkv_trt_subprocess_host, flexkv_trt_subprocess_ports
 
 class TransferManagerOnRemote(TransferManager):
     """
     TransferManager for remote mode, used for multi-node tensor parallelism.
     """
-    def __init__(self):
-        self.master_host, self.master_ports = get_master_host_and_ports_from_env()
+    def __init__(self, mode: str = "Default"):
+        if mode == "Default":
+            self.master_host, self.master_ports = get_master_host_and_ports_from_env()
+        elif mode == "TrtllmSubprocess":
+            self.master_host, self.master_ports = get_trtllm_subprocess_host_and_ports_from_env()
+        else:
+            raise ValueError(f"Invalid mode: {mode}, must be Default or TrtllmSubprocess")
 
         self.context = zmq.Context()
         self.command_socket = self.context.socket(zmq.PULL)
@@ -164,6 +185,7 @@ class TransferManagerOnRemote(TransferManager):
         self._connect_to_master_transfer_manager()
 
         self._initialize_with_config()
+        flexkv_logger.info(f"Initialized TransferManagerOnRemote with config successfully")
 
     def _connect_to_master_transfer_manager(self) -> None:
         try:
@@ -196,7 +218,7 @@ class TransferManagerOnRemote(TransferManager):
                 {self.cache_config = }, {self.gpu_register_port = }.")
         else:
             raise RuntimeError(f"Expected config message, got: {config_msg}")
-
+        flexkv_logger.info(f"Received config from master successfully")
         super().__init__(self.model_config, self.cache_config, self.gpu_register_port)
 
     def _polling_worker(self) -> None:
@@ -314,14 +336,118 @@ class TransferManagerOnRemote(TransferManager):
 
     @classmethod
     def create_process(cls, **kwargs: Any) -> Process:
-        def _run():
-            instance = cls(**kwargs)
-            instance.start()
-            if hasattr(instance, '_worker_thread') and instance._worker_thread is not None:
-                instance._worker_thread.join()  # block until worker thread exits
-        process = Process(target=_run, daemon=False)
-        process.start()
-        return process
+        import tempfile
+        import os
+
+        # Serialize the class and kwargs
+        cls_data = pickle.dumps(cls)
+        kwargs_data = pickle.dumps(kwargs)
+
+        # Create temporary files for serialized data
+        with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.cls') as f:
+            f.write(cls_data)
+            cls_file = f.name
+
+        with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.kwargs') as f:
+            f.write(kwargs_data)
+            kwargs_file = f.name
+
+        # Prepare environment - remove MPI-related variables to avoid conflicts
+        env = os.environ.copy()
+        # CRITICAL: Remove CUDA_VISIBLE_DEVICES to allow access to all GPUs
+        # TransferManager needs to access all physical GPUs for IPC
+        if 'CUDA_VISIBLE_DEVICES' in env:
+            flexkv_logger.info(f"Removing CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} "
+                               "for TransferManager subprocess")
+            env.pop('CUDA_VISIBLE_DEVICES', None)
+
+        # Create the subprocess script
+        transfer_manager_script = textwrap.dedent(f'''
+            import os
+            import sys
+            import pickle
+            import tempfile
+            from flexkv.common.debug import flexkv_logger
+            
+            # Immediately disable MPI to avoid conflicts
+            os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
+
+            try:
+                # Load the class and kwargs
+                with open("{cls_file}", "rb") as f:
+                    cls = pickle.load(f)
+
+                with open("{kwargs_file}", "rb") as f:
+                    kwargs = pickle.load(f)
+
+                # Create and start TransferManagerOnRemote instance
+                flexkv_logger.info(f"Creating TransferManagerOnRemote instance...")
+                instance = cls(**kwargs)
+                flexkv_logger.info(f"Starting TransferManagerOnRemote instance...")
+                instance.start()
+                flexkv_logger.info(f"TransferManager instance started successfully")
+                
+                # Keep running until worker thread exits
+                if hasattr(instance, '_worker_thread') and instance._worker_thread is not None:
+                    instance._worker_thread.join()
+
+            except Exception as e:
+                print(f"Error in TransferManager subprocess: {{e}}", file=sys.stderr)
+                sys.exit(1)
+            finally:
+                # Clean up temporary files
+                try:
+                    os.unlink("{cls_file}")
+                    os.unlink("{kwargs_file}")
+                except Exception:
+                    pass
+        ''').strip()
+
+        # Start the subprocess
+        process = subprocess.Popen([
+            sys.executable, '-c', transfer_manager_script
+        ], env=env, stdout=None, stderr=None, text=True)  # None = inherit parent's stdout/stderr
+        flexkv_logger.info(f"TransferManager subprocess started, PID: {process.pid}")
+
+        # Clean up temporary files after subprocess completes
+        def cleanup_files():
+            # Wait for subprocess to complete before cleaning up files
+            process.wait()
+            try:
+                os.unlink(cls_file)
+                os.unlink(kwargs_file)
+            except Exception:
+                pass
+
+        import threading
+        cleanup_thread = threading.Thread(target=cleanup_files, daemon=True)
+        cleanup_thread.start()
+
+        # Return a wrapper that mimics multiprocessing.Process interface
+        class SubprocessWrapper:
+            def __init__(self, popen_process):
+                self._popen = popen_process
+                self.pid = popen_process.pid
+
+            def is_alive(self):
+                return self._popen.poll() is None
+
+            def terminate(self):
+                self._popen.terminate()
+
+            def join(self, timeout=None):
+                return self._popen.wait(timeout)
+
+            def close(self):
+                # Close the subprocess pipes
+                if self._popen.stdout:
+                    self._popen.stdout.close()
+                if self._popen.stderr:
+                    self._popen.stderr.close()
+                if self._popen.stdin:
+                    self._popen.stdin.close()
+
+        return SubprocessWrapper(process)
 
 class TransferManagerHandleBase(ABC):
     @abstractmethod
@@ -386,6 +512,7 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
         self.result_parent_conn, self.result_child_conn = self.mp_ctx.Pipe()
 
         self.process: Optional[Process] = None
+        self.start_event = self.mp_ctx.Event()
         self.ready_event = self.mp_ctx.Event()
 
         self._completed_results: List[Tuple[int, int]] = []
@@ -401,7 +528,8 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                   self.command_child_conn,
                   self.result_child_conn,
                   self.gpu_register_port,
-                  self.ready_event),
+                  self.ready_event,
+                  self.start_event),
             daemon=False
         )
         self.process.start()
@@ -412,8 +540,11 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
                         command_conn,
                         result_conn,
                         gpu_register_port: str,
-                        ready_event) -> None:
+                        ready_event,
+                        start_event) -> None:
         try:
+            start_event.set()
+            os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
             transfer_manager = TransferManager(model_config, cache_config, gpu_register_port)
             transfer_manager.initialize_transfer_engine()
             transfer_manager.start()
@@ -443,7 +574,10 @@ class TransferManagerInterProcessHandle(TransferManagerHandleBase):
             result_conn.close()
 
     def start(self) -> None:
+        os.environ['MPI4PY_RC_INITIALIZE'] = 'false'
         self._start_process()
+        self.start_event.wait()
+        os.environ['MPI4PY_RC_INITIALIZE'] = 'true'
 
     def is_ready(self) -> bool:
         return self.ready_event.is_set()
@@ -537,6 +671,13 @@ class TranserManagerMultiNodeHandle(TransferManagerHandleBase):
 
         except Exception as e:
             flexkv_logger.error(f"Master failed to bind ports: {e}")
+            try:
+                self.command_socket.close()
+                self.result_socket.close()
+                self.query_socket.close()
+                self.context.term()
+            except Exception:
+                pass
             raise
 
     def send_config_to_remotes(self) -> None:
