@@ -169,17 +169,21 @@ void TPTransferThreadGroup::tp_group_transfer(
   std::vector<std::future<void>> futures;
   futures.reserve(num_gpus_);
 
-  bool enable_sharded_d2h = is_mla && !is_host_to_device;
+  // MLA D2H: every TP rank holds an identical copy of the MLA KV, so only
+  // rank 0 writes the full chunk to CPU. The other ranks skip the D2H copy
+  // entirely (instead of each writing a 1/num_gpus shard), avoiding redundant
+  // puts of the same data.
+  bool mla_d2h = is_mla && !is_host_to_device;
   const int num_blocks = gpu_block_id_tensor.numel();
   const auto xfer_t0 = std::chrono::steady_clock::now();
 
   FLEXKV_D2H_LOG(
       "tp_group_transfer ENTER backend=%s num_gpus=%d blocks=%d "
-      "h2d=%d ce=%d mla=%d sharded_d2h=%d layer_id=%d layer_gran=%d cta=%d "
+      "h2d=%d ce=%d mla=%d mla_d2h=%d layer_id=%d layer_gran=%d cta=%d "
       "cpu_strides(kv/layer/block/tp)=%lld/%lld/%lld/%lld cpu_base=%p",
       backend_name(backend_type_), num_gpus_, num_blocks,
       is_host_to_device ? 1 : 0, use_ce_transfer ? 1 : 0, is_mla ? 1 : 0,
-      enable_sharded_d2h ? 1 : 0, layer_id, layer_granularity, transfer_num_cta,
+      mla_d2h ? 1 : 0, layer_id, layer_granularity, transfer_num_cta,
       static_cast<long long>(cpu_kv_stride_in_bytes),
       static_cast<long long>(cpu_layer_stride_in_bytes),
       static_cast<long long>(cpu_block_stride_in_bytes),
@@ -202,6 +206,10 @@ void TPTransferThreadGroup::tp_group_transfer(
   }
 
   for (int i = 0; i < num_gpus_; ++i) {
+    // MLA D2H: only rank 0 writes the (identical) MLA KV to CPU; other ranks
+    // skip the transfer entirely to avoid redundant puts of the same data.
+    if (mla_d2h && i != 0)
+      continue;
     futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
       D2hDebugGpuScope gpu_scope(i);
       try {
@@ -211,19 +219,14 @@ void TPTransferThreadGroup::tp_group_transfer(
             static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
         void *cpu_ptr = cpu_blocks_;
         int64_t cpu_startoff_inside_chunks = 0;
-        if (enable_sharded_d2h)
-          cpu_startoff_inside_chunks =
-              i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_;
-        else if (!is_mla)
+        if (!is_mla)
           cpu_startoff_inside_chunks = i * cpu_tp_stride_in_bytes;
-        int64_t gpu_startoff_inside_chunks =
-            enable_sharded_d2h ? i * gpu_chunk_sizes_in_bytes_[i] / num_gpus_
-                               : 0;
+        // MLA D2H runs only on rank 0 and writes the whole chunk, so no
+        // per-rank GPU/CPU shard offset is needed.
+        int64_t gpu_startoff_inside_chunks = 0;
         // we assume that the chunk size is the same for all gpus,
         // even if they have different number of gpu_blocks
-        int64_t chunk_size = enable_sharded_d2h
-                                 ? gpu_chunk_sizes_in_bytes_[i] / num_gpus_
-                                 : gpu_chunk_sizes_in_bytes_[i];
+        int64_t chunk_size = gpu_chunk_sizes_in_bytes_[i];
 
         FLEXKV_D2H_LOG(
             "tp_group_transfer gpu=%d dev=%d chunk=%lld gpu_off=%lld "

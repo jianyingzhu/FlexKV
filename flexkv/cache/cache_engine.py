@@ -897,6 +897,17 @@ class GlobalCacheEngine:
         ssd_matched_blocks = ssd_matched_result.physical_blocks[:ssd_matched_result.num_ready_matched_blocks]
         ssd_matched_blocks = ssd_matched_blocks[block_mask_start:block_mask_end]
 
+        # [FLEXKV-BLKHASH] pair each matched CPU block id with the token-block
+        # hash it is serving, so a GET's cpu block can be cross-checked against
+        # the PUT that wrote it (same block id MUST carry the same token hash).
+        flexkv_logger.info(
+            "[FLEXKV-BLKHASH] GET request_id=%s cpu_block->tokhash=%s",
+            request_id,
+            list(zip(cpu_matched_blocks.tolist(),
+                     sequence_meta.block_hashes[
+                         block_mask_start:block_mask_start + len(cpu_matched_blocks)].tolist())),
+        )
+
         # TODO: is this possible?
         if len(cpu_matched_blocks) > len(ssd_matched_blocks):
             ssd_matched_blocks = np.array([], dtype=np.int64)
@@ -1433,6 +1444,16 @@ class GlobalCacheEngine:
             f"fragment2_num_blocks={fragment2_num_blocks}, "
             f"{summarize_id_tensor('gpu_src', fragment12_gpu_blocks)}, "
             f"{summarize_id_tensor('cpu_dst', fragment12_cpu_blocks)}"
+        )
+        # [FLEXKV-BLKHASH] pair each newly-allocated CPU dst block with the
+        # token-block hash being written into it. fragment12 covers token-blocks
+        # [block_mask_start + num_skipped_blocks : block_mask_end].
+        flexkv_logger.info(
+            "[FLEXKV-BLKHASH] PUT request_id=%s cpu_block->tokhash=%s",
+            request_id,
+            list(zip(np.asarray(fragment12_cpu_blocks).tolist(),
+                     sequence_meta.block_hashes[
+                         block_mask_start + num_skipped_blocks:block_mask_end].tolist())),
         )
         transfer_graph.add_transfer_op(op_d2h)
         finished_ops_ids.append(op_d2h.op_id)

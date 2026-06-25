@@ -178,16 +178,23 @@ void TPGDSTransferThreadGroup::tp_group_transfer(
   std::vector<std::future<void>> futures;
   futures.reserve(num_gpus_);
 
+  // MLA write (D2DISK): every TP rank holds an identical copy of the MLA KV,
+  // so only rank 0 writes the full chunk; other ranks skip it to avoid
+  // redundant puts of the same data. (MLA reads still run on all ranks.)
+  const bool mla_write = is_mla && !is_read;
   for (int i = 0; i < num_gpus_; ++i) {
+    if (mla_write && i != 0)
+      continue;
     futures.emplace_back(enqueue_for_gpu(i, [&, i]() {
       try {
         // Prepare layer ID list for this specific layer range
-        torch::Tensor layer_id_list = torch::arange(layer_id, layer_id + layer_granularity, 
+        torch::Tensor layer_id_list = torch::arange(layer_id, layer_id + layer_granularity,
                                                     torch::TensorOptions().dtype(torch::kInt32));
         //here the ssd_copy_off_inside_chunks is the offset of the ssd block in the ssd file
         int64_t ssd_copy_off_inside_chunks;
         int64_t gpu_chunk_size_in_bytes = gpu_chunk_sizes_in_bytes_[i];
-        //for simplicity, we don't consider write deduplication for multiple gpus for mla (in fact write will not be used)
+        // MLA: writes run only on rank 0 (full chunk); reads run on all ranks
+        // reading the full identical chunk. Either way no per-rank shard offset.
         if (is_mla) {
             ssd_copy_off_inside_chunks = 0;
         } else {
